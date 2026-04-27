@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cartas Bajo la Puerta</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        
+        /* Interfaz de bloqueo inicial */
+        #blocker {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.8); display: flex; align-items: center;
+            justify-content: center; flex-direction: column; color: white; z-index: 100;
+        }
+        #blocker h1 { font-size: 3rem; margin-bottom: 1rem; }
+        #blocker p { font-size: 1.2rem; cursor: pointer; padding: 15px 30px; border: 2px solid white; transition: 0.3s; }
+        #blocker p:hover { background-color: white; color: black; }
+
+        /* Mirilla */
+        #crosshair {
+            position: absolute; top: 50%; left: 50%; width: 6px; height: 6px;
+            background: rgba(255,255,255,0.8); border-radius: 50%;
+            transform: translate(-50%, -50%); z-index: 10; display: none;
+        }
+
+        /* Indicador de interacción */
+        #interaction-prompt {
+            position: absolute; top: 60%; left: 50%; transform: translateX(-50%);
+            color: white; font-size: 1.5rem; z-index: 10; display: none;
+            text-shadow: 2px 2px 4px black;
+        }
+
+        /* Pantalla de la carta y decisión */
+        #decision-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.9); z-index: 50; display: none;
+            flex-direction: column; align-items: center; justify-content: center; color: white;
+        }
+        .letter-box {
+            background-color: #f4f1ea; color: #333; padding: 40px; width: 60%; max-width: 600px;
+            border-radius: 5px; box-shadow: 0 0 20px rgba(0,0,0,0.5); font-style: italic; line-height: 1.6;
+        }
+        #hand-result {
+            margin-top: 30px; font-size: 2rem; font-weight: bold; height: 40px;
+        }
+        #cam-warning { color: #ffaaaa; margin-top: 10px; font-size: 0.9rem; display:none; }
+        
+        /* Video de la cámara (oculto pero necesario para MediaPipe) */
+        #input-video { position: absolute; bottom: 10px; right: 10px; width: 200px; height: 150px; z-index: 60; border: 2px solid white; display: none; transform: scaleX(-1);}
+    </style>
+
+    <!-- CDN de MediaPipe (Legacy para facilitar carga en un solo archivo) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- Three.js Import Map -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="blocker">
+        <h1>Cartas Bajo la Puerta</h1>
+        <p id="start-btn">Haz clic para jugar</p>
+        <p style="font-size: 0.8rem; margin-top: 10px; border: none;">WASD para moverse | Ratón para mirar | E para interactuar</p>
+    </div>
+
+    <div id="crosshair"></div>
+    <div id="interaction-prompt">Presiona [E]</div>
+
+    <div id="decision-screen">
+        <div class="letter-box">
+            <p>Hermano, necesito que me ayudes. Estoy en un lío y no sé qué hacer. ¿Me ayudas?</p>
+        </div>
+        <div id="hand-result">Esperando mano...</div>
+        <div id="cam-warning">*Se requiere acceso a la cámara para tomar la decisión.</div>
+    </div>
+
+    <video id="input-video"></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        // --- VARIABLES GLOBALES ---
+        let camera, scene, renderer, controls;
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let velocity = new THREE.Vector3();
+        let direction = new THREE.Vector3();
+        let raycaster, doorMesh, letterMesh;
+        let canInteractDoor = false, canInteractLetter = false;
+        let isLetterSliding = false;
+        let gameState = 'LOCKED'; // LOCKED, WALKING, READING, DECIDING
+
+        // --- INICIALIZAR THREE.JS ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x202020);
+            scene.fog = new THREE.Fog(0x202020, 1, 15);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 1.7, 3); // Altura de los ojos de un humano
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Controles FPS
+            controls = new PointerLockControls(camera, document.body);
+            scene.add(controls.getObject());
+
+            // Luces
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(0, 5, 5);
+            scene.add(dirLight);
+
+            // Materiales
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x554433, roughness: 0.8 });
+            const wallMat = new THREE.MeshStandardMaterial({ color: 0x887766, roughness: 0.9 });
+            const doorMat = new THREE.MeshStandardMaterial({ color: 0x332211, roughness: 0.5 });
+            const letterMat = new THREE.MeshStandardMaterial({ color: 0xf4f1ea, side: THREE.DoubleSide });
+
+            // Construir Habitación (Suelo, Techo, Paredes)
+            const floor = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), floorMat);
+            floor.rotation.x = -Math.PI / 2; scene.add(floor);
+            
+            const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), wallMat);
+            ceiling.rotation.x = Math.PI / 2; ceiling.position.y = 3; scene.add(ceiling);
+            
+            const wallBack = new THREE.Mesh(new THREE.PlaneGeometry(10, 3), wallMat);
+            wallBack.position.set(0, 1.5, -5); scene.add(wallBack);
+            
+            const wallLeft = new THREE.Mesh(new THREE.PlaneGeometry(10, 3), wallMat);
+            wallLeft.rotation.y = Math.PI / 2; wallLeft.position.set(-5, 1.5, 0); scene.add(wallLeft);
+            
+            const wallRight = new THREE.Mesh(new THREE.PlaneGeometry(10, 3), wallMat);
+            wallRight.rotation.y = -Math.PI / 2; wallRight.position.set(5, 1.5, 0); scene.add(wallRight);
+
+            // Puerta (En la pared del fondo)
+            doorMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 2.5), doorMat);
+            doorMesh.position.set(0, 1.25, -4.99); scene.add(doorMesh);
+
+            // Carta (Empieza fuera de la vista, debajo de la puerta)
+            letterMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.2), letterMat);
+            letterMesh.position.set(0, 0.1, -5.5); // Bajo la puerta
+            letterMesh.rotation.x = -Math.PI / 2; // Acostada en el suelo
+            scene.add(letterMesh);
+
+            raycaster = new THREE.Raycaster();
+
+            // Eventos
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+            window.addEventListener('resize', onWindowResize);
+
+            animate();
+        }
+
+        // --- CONTROLES Y MOVIMIENTO ---
+        function onKeyDown(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = true; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = true; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = true; break;
+                case 'ArrowRight': case 'KeyD': moveRight = true; break;
+                case 'KeyE': interact(); break;
+            }
+        }
+        function onKeyUp(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = false; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = false; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = false; break;
+                case 'ArrowRight': case 'KeyD': moveRight = false; break;
+            }
+        }
+
+        function interact() {
+            if (gameState === 'WALKING') {
+                if (canInteractDoor && !isLetterSliding) {
+                    ringBellAndSlideLetter();
+                } else if (canInteractLetter) {
+                    startDecisionPhase();
+                }
+            }
+        }
+
+        // --- LÓGICA DEL TIMBRE Y CARTA ---
+        function ringBellAndSlideLetter() {
+            isLetterSliding = true;
+            document.getElementById('interaction-prompt').style.display = 'none';
+            alert("¡DING DONG! (Suena el timbre)");
+            
+            // Animar carta deslizándose
+            const slideInterval = setInterval(() => {
+                letterMesh.position.z += 0.05; // Se desliza hacia adentro
+                if (letterMesh.position.z >= -4.2) { // Posición final dentro de la casa
+                    clearInterval(slideInterval);
+                    isLetterSliding = false;
+                }
+            }, 30);
+        }
+
+        // --- FASE DE DECISIÓN (HAND TRACKING) ---
+        function startDecisionPhase() {
+            gameState = 'DECIDING';
+            controls.unlock(); // Sacar al jugador del control FPS
+            
+            document.getElementById('crosshair').style.display = 'none';
+            document.getElementById('decision-screen').style.display = 'flex';
+            document.getElementById('input-video').style.display = 'block';
+            document.getElementById('cam-warning').style.display = 'block';
+
+            initHandTracking();
+        }
+
+        // --- MEDIAPIPE HAND TRACKING ---
+        function initHandTracking() {
+            const videoElement = document.getElementById('input-video');
+            const hands = new window.Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onHandResults);
+
+            const camera = new window.Camera(videoElement, {
+                onFrame: async () => {
+                    if (gameState === 'DECIDING') await hands.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+            camera.start();
+        }
+
+        function onHandResults(results) {
+            if (results.multiHandedness && results.multiHandedness.length > 0) {
+                // IMPORTANTE: MediaPipe invierte la cámara. 
+                // "Right" en la pantalla es físicamente la mano IZQUIERDA del usuario.
+                const detectedHand = results.multiHandedness[0].label;
+                
+                if (detectedHand === 'Right') {
+                    // El usuario levantó la mano IZQUIERDA
+                    makeDecision("NO");
+                } else if (detectedHand === 'Left') {
+                    // El usuario levantó la mano DERECHA
+                    makeDecision("SÍ");
+                }
+            }
+        }
+
+        function makeDecision(choice) {
+            gameState = 'END';
+            document.getElementById('hand-result').innerText = `Decisión tomada: ${choice}`;
+            document.getElementById('hand-result').style.color = choice === "SÍ" ? "#4CAF50" : "#F44336";
+            document.getElementById('cam-warning').style.display = 'none';
+            
+            // Aquí iría la lógica de cambiar variables y pasar al siguiente capítulo
+            setTimeout(() => {
+                alert(`Fin de la prueba. Elegiste: ${choice}. El juego continuaría...`);
+                location.reload(); // Reset por ser demo
+            }, 2000);
+        }
+
+        // --- RAYCASTING (Mirar e interactuar) ---
+        function checkInteractions() {
+            if (gameState !== 'WALKING') return;
+
+            raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+            const interacts = [doorMesh, letterMesh];
+            const intersections = raycaster.intersectObjects(interacts);
+
+            document.getElementById('interaction-prompt').style.display = 'none';
+            canInteractDoor = false;
+            canInteractLetter = false;
+
+            if (intersections.length > 0) {
+                const object = intersections[0].object;
+                if (object === doorMesh && !isLetterSliding && letterMesh.position.z < -4.5) {
+                    canInteractDoor = true;
+                    document.getElementById('interaction-prompt').innerText = "Mirar bajo la puerta [E]";
+                    document.getElementById('interaction-prompt').style.display = 'block';
+                } else if (object === letterMesh && !isLetterSliding && letterMesh.position.z >= -4.2) {
+                    canInteractLetter = true;
+                    document.getElementById('interaction-prompt').innerText = "Leer carta [E]";
+                    document.getElementById('interaction-prompt').style.display = 'block';
+                }
+            }
+        }
+
+        // --- LOOP PRINCIPAL ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (controls.isLocked && gameState === 'WALKING') {
+                // Físicas básicas de movimiento
+                velocity.x -= velocity.x * 10.0 * 0.016; // deltaTime aproximado
+                velocity.z -= velocity.z * 10.0 * 0.016;
+
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveRight) - Number(moveLeft);
+                direction.normalize();
+
+                if (moveForward || moveBackward) velocity.z -= direction.z * 50.0 * 0.016;
+                if (moveLeft || moveRight) velocity.x -= direction.x * 50.0 * 0.016;
+
+                controls.moveRight(-velocity.x * 0.016);
+                controls.moveForward(-velocity.z * 0.016);
+
+                // Limitar área de movimiento
+                const pos = controls.getObject().position;
+                pos.x = Math.max(-4.5, Math.min(4.5, pos.x));
+                pos.z = Math.max(-4, Math.min(4.5, pos.z));
+
+                checkInteractions();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- INICIO ---
+        document.getElementById('start-btn').addEventListener('click', () => {
+            controls.lock();
+        });
+
+        controls.addEventListener('lock', () => {
+            document.getElementById('blocker').style.display = 'none';
+            document.getElementById('crosshair').style.display = 'block';
+            gameState = 'WALKING';
+        });
+
+        controls.addEventListener('unlock', () => {
+            if (gameState !== 'DECIDING' && gameState !== 'END') {
+                document.getElementById('blocker').style.display = 'flex';
+                document.getElementById('crosshair').style.display = 'none';
+                gameState = 'LOCKED';
+            }
+        });
+
+        init();
+    </script>
+</body>
+</html>
