@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>Ecos de Puerta - Versión Corregida</title>
+    <title>Ecos de Puerta - Audio y Colisiones Fix</title>
     <style>
         body { margin: 0; overflow: hidden; font-family: 'Courier New', Courier, monospace; background-color: #111; color: #eee; user-select: none; }
         
@@ -61,6 +61,7 @@
             position: absolute; top: 60%; left: 50%; transform: translate(-50%, -50%);
             font-size: 1.5rem; display: none; text-shadow: 1px 1px 2px black;
             text-align: center;
+            color: #fff; font-weight: bold; background: rgba(0,0,0,0.5); padding: 10px 20px; border-radius: 5px;
         }
 
         /* Ending Screen */
@@ -93,7 +94,7 @@
             <p>Eres un hombre que vive solo. Tú controlas tu destino y el de tus hermanos.</p>
             <p style="font-size: 0.9rem; color: #888;">
                 CONTROLES:<br>
-                [W, A, S, D] Moverse (Caminar realista)<br>
+                [W, A, S, D] Moverse<br>
                 [MOUSE] Mirar alrededor<br>
                 [E] Interactuar (Recoger carta / Leer en escritorio / Abrir puerta)<br>
                 <br>
@@ -134,6 +135,77 @@
         import * as THREE from 'three';
         import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 
+        // --- AUDIO SYSTEM (Web Audio API) ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        const SoundFX = {
+            playDoorbell: () => {
+                if(audioCtx.state === 'suspended') audioCtx.resume();
+                const t = audioCtx.currentTime;
+                
+                // Tone 1
+                const osc1 = audioCtx.createOscillator();
+                const gain1 = audioCtx.createGain();
+                osc1.type = 'sine';
+                osc1.frequency.setValueAtTime(800, t);
+                osc1.frequency.exponentialRampToValueAtTime(600, t + 0.5);
+                gain1.gain.setValueAtTime(0.5, t);
+                gain1.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+                
+                osc1.connect(gain1);
+                gain1.connect(audioCtx.destination);
+                osc1.start(t);
+                osc1.stop(t + 0.5);
+
+                // Tone 2 (Delay for "Dong")
+                setTimeout(() => {
+                    const t2 = audioCtx.currentTime;
+                    const osc2 = audioCtx.createOscillator();
+                    const gain2 = audioCtx.createGain();
+                    osc2.type = 'triangle';
+                    osc2.frequency.setValueAtTime(400, t2);
+                    gain2.gain.setValueAtTime(0.5, t2);
+                    gain2.gain.exponentialRampToValueAtTime(0.01, t2 + 1.0);
+                    osc2.connect(gain2);
+                    gain2.connect(audioCtx.destination);
+                    osc2.start(t2);
+                    osc2.stop(t2 + 1.0);
+                }, 200);
+            },
+
+            playKnock: () => {
+                if(audioCtx.state === 'suspended') audioCtx.resume();
+                const t = audioCtx.currentTime;
+                
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'square'; // Wood-like thud
+                osc.frequency.setValueAtTime(120, t);
+                osc.frequency.exponentialRampToValueAtTime(40, t + 0.1);
+                
+                gain.gain.setValueAtTime(1, t);
+                gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1);
+                
+                // Filter to make it dull
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 300;
+
+                osc.connect(filter);
+                filter.connect(gain);
+                gain.connect(audioCtx.destination);
+                
+                osc.start(t);
+                osc.stop(t + 0.1);
+            },
+
+            playKnocksSequence: () => {
+                SoundFX.playKnock();
+                setTimeout(SoundFX.playKnock, 400);
+                setTimeout(SoundFX.playKnock, 800);
+            }
+        };
+
         // --- GAME STATE ---
         const gameState = {
             hasStarted: false,
@@ -141,7 +213,7 @@
             currentLetterIndex: 0,
             hasPickedUpLetter: false,
             canInteract: false,
-            interactType: null, // 'door', 'desk', 'letter'
+            interactType: null,
             stats: { brother: 50, sister: 50 },
             isGameOver: false
         };
@@ -180,14 +252,13 @@
         scene.fog = new THREE.Fog(0x111111, 1, 12);
 
         const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        camera.position.set(0, 1.6, 2); // Start in middle of room
+        camera.position.set(0, 1.6, 2);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.shadowMap.enabled = true;
         document.getElementById('game-container').appendChild(renderer.domElement);
 
-        // --- CONTROLS & PHYSICS ---
         const controls = new PointerLockControls(camera, document.body);
         
         // Movement State
@@ -196,10 +267,10 @@
         const direction = new THREE.Vector3();
 
         // Physics Constants
-        const MOVEMENT_ACCEL = 60.0; // Reduced for realistic speed
+        const MOVEMENT_ACCEL = 60.0;
         const MOVEMENT_FRICTION = 8.0;
         const PLAYER_HEIGHT = 1.6;
-        const ROOM_LIMIT = 4.5; // Wall boundaries
+        const ROOM_LIMIT = 4.5;
 
         // Key Listeners
         document.addEventListener('keydown', (event) => {
@@ -221,23 +292,17 @@
             }
         });
 
-        // --- BUILDING SCENE ---
-        const textureLoader = new THREE.TextureLoader();
-        
-        // Materials
+        // --- SCENE ---
         const matFloor = new THREE.MeshStandardMaterial({ color: 0x332222, roughness: 0.9 });
         const matWall = new THREE.MeshStandardMaterial({ color: 0x555555 });
         const matDoor = new THREE.MeshStandardMaterial({ color: 0x2a1a0a });
         const matDesk = new THREE.MeshStandardMaterial({ color: 0x3d3329 });
         const matPaper = new THREE.MeshStandardMaterial({ color: 0xffffee, side: THREE.DoubleSide });
 
-        // Room
-        const floorGeo = new THREE.PlaneGeometry(20, 20);
-        const floor = new THREE.Mesh(floorGeo, matFloor);
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), matFloor);
         floor.rotation.x = -Math.PI / 2;
         scene.add(floor);
 
-        // Walls (Visual)
         const wallGeo = new THREE.BoxGeometry(10, 4, 0.5);
         const backWall = new THREE.Mesh(wallGeo, matWall);
         backWall.position.set(0, 2, -ROOM_LIMIT);
@@ -253,19 +318,17 @@
         sideWallR.position.set(ROOM_LIMIT, 2, 0);
         scene.add(sideWallR);
 
-        // Door Object
         const doorGeo = new THREE.BoxGeometry(1.5, 2.5, 0.2);
         const door = new THREE.Mesh(doorGeo, matDoor);
         door.position.set(0, 1.25, -ROOM_LIMIT + 0.2);
         scene.add(door);
         gameState.doorMesh = door;
 
-        // Desk Object
+        // Desk Setup
         const deskGroup = new THREE.Group();
         const deskTop = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.1, 1.2), matDesk);
         deskTop.position.y = 1;
         deskGroup.add(deskTop);
-        // Legs
         for(let x=-1; x<=1; x+=2) {
             for(let z=-1; z<=1; z+=2) {
                 const leg = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1, 0.15), matDesk);
@@ -277,10 +340,10 @@
         deskGroup.rotation.y = -Math.PI / 6;
         scene.add(deskGroup);
         
-        // Define interaction point for desk (Front center)
+        // Interaction Zones
+        // Desk Front center calculation
         gameState.deskPos = new THREE.Vector3(3.5, 0, -1.5); 
 
-        // Letter on Floor (Initially hidden)
         const letterGeo = new THREE.PlaneGeometry(0.4, 0.25);
         const letterMesh = new THREE.Mesh(letterGeo, matPaper);
         letterMesh.rotation.x = -Math.PI / 2;
@@ -288,7 +351,6 @@
         scene.add(letterMesh);
         gameState.letterMesh = letterMesh;
 
-        // Lights
         const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
         scene.add(ambientLight);
 
@@ -297,25 +359,30 @@
         bulbLight.castShadow = true;
         scene.add(bulbLight);
 
-        // --- CORE GAME LOOP ---
+        // --- HELPERS ---
+        // FIX: Distance ignoring Y axis (Height) to make interactions reliable
+        function getDistanceHorizontal(v1, v2) {
+            const dx = v1.x - v2.x;
+            const dz = v1.z - v2.z;
+            return Math.sqrt(dx*dx + dz*dz);
+        }
+
+        // --- GAME LOOP ---
         const clock = new THREE.Clock();
 
         function animate() {
             requestAnimationFrame(animate);
 
             if (gameState.hasStarted && !gameState.isReading && !gameState.isGameOver) {
-                const delta = Math.min(clock.getDelta(), 0.1); // Cap delta to prevent huge jumps
+                const delta = Math.min(clock.getDelta(), 0.1);
 
-                // 1. Calculate Movement Direction
                 direction.z = Number(moveState.forward) - Number(moveState.backward);
                 direction.x = Number(moveState.right) - Number(moveState.left);
-                direction.normalize(); // Ensure consistent speed in diagonals
+                direction.normalize();
 
-                // 2. Apply Friction (Deceleration)
                 velocity.x -= velocity.x * MOVEMENT_FRICTION * delta;
                 velocity.z -= velocity.z * MOVEMENT_FRICTION * delta;
 
-                // 3. Apply Acceleration based on Camera View
                 if (moveState.forward || moveState.backward) {
                     velocity.z -= direction.z * MOVEMENT_ACCEL * delta;
                 }
@@ -323,55 +390,32 @@
                     velocity.x -= direction.x * MOVEMENT_ACCEL * delta;
                 }
 
-                // 4. Calculate Potential New Position
-                // moveRight and moveForward handle the rotation relative to camera automatically
-                // We move the controls object, which moves the camera
-                
-                // We must apply velocity to the camera position manually to handle collisions better
                 const forwardVector = new THREE.Vector3();
                 camera.getWorldDirection(forwardVector);
-                forwardVector.y = 0; // Flatten to prevent flying
+                forwardVector.y = 0; // Flatten movement
                 forwardVector.normalize();
 
                 const rightVector = new THREE.Vector3();
                 rightVector.crossVectors(forwardVector, camera.up).normalize();
 
-                // Move vector = (Forward * Z-Vel) + (Right * X-Vel)
-                // Note: In PointerLockControls, -Z is forward locally, but we derived Z vel from W/S.
-                // Let's use the helper methods provided by controls, they are robust.
-                
-                // But to handle collision precisely, let's do vector math:
                 const moveVec = new THREE.Vector3();
-                moveVec.addScaledVector(forwardVector, -velocity.z * delta); // -Z is forward in our velocity logic
-                moveVec.addScaledVector(rightVector, -velocity.x * delta); // -X is right in our velocity logic
+                moveVec.addScaledVector(forwardVector, -velocity.z * delta);
+                moveVec.addScaledVector(rightVector, -velocity.x * delta);
 
                 const nextPos = camera.position.clone().add(moveVec);
 
-                // 5. Collision Detection (Room Bounds)
-                let collided = false;
-
-                // X Walls
-                if (nextPos.x < -ROOM_LIMIT + 0.5 || nextPos.x > ROOM_LIMIT - 0.5) {
-                    velocity.x = 0;
-                    collided = true;
-                } else {
+                // Collision Walls
+                if (nextPos.x > -ROOM_LIMIT + 0.5 && nextPos.x < ROOM_LIMIT - 0.5) {
                     camera.position.x = nextPos.x;
-                }
+                } else { velocity.x = 0; }
 
-                // Z Walls (Back wall is at -ROOM_LIMIT, Front is at +ROOM_LIMIT)
-                if (nextPos.z < -ROOM_LIMIT + 0.5 || nextPos.z > ROOM_LIMIT - 0.5) {
-                    velocity.z = 0;
-                    collided = true;
-                } else {
+                if (nextPos.z > -ROOM_LIMIT + 0.5 && nextPos.z < ROOM_LIMIT - 0.5) {
                     camera.position.z = nextPos.z;
-                }
+                } else { velocity.z = 0; }
 
-                // 6. Anti-Fly Lock
-                camera.position.y = PLAYER_HEIGHT;
+                camera.position.y = PLAYER_HEIGHT; // Anti-fly lock
 
-                // 7. Check Interactions (Distance checks)
                 checkInteractions();
-
             }
 
             renderer.render(scene, camera);
@@ -383,30 +427,33 @@
             gameState.interactType = null;
             document.getElementById('interact-prompt').style.display = 'none';
 
-            // 1. Check Door (True Ending trigger)
-            const distDoor = pPos.distanceTo(new THREE.Vector3(0, PLAYER_HEIGHT, -ROOM_LIMIT + 1));
+            // 1. Door (Final)
+            const distDoor = getDistanceHorizontal(pPos, new THREE.Vector3(0, 0, -ROOM_LIMIT + 1));
             if (distDoor < 2.0 && gameState.currentLetterIndex >= letters.length) {
                 gameState.canInteract = true;
                 gameState.interactType = 'door';
                 showPrompt("ABRIR PUERTA");
             }
 
-            // 2. Check Letter on Floor
+            // 2. Letter on Floor
+            // Letter Position
+            const letterPos = new THREE.Vector3(0, 0, -ROOM_LIMIT + 2);
+            
             if (!gameState.hasPickedUpLetter && gameState.letterMesh.visible) {
-                // Letter spawns near door
-                const letterPos = new THREE.Vector3(0, 0, -ROOM_LIMIT + 2);
-                const distLetter = pPos.distanceTo(letterPos);
-                if (distLetter < 1.5) {
+                const distLetter = getDistanceHorizontal(pPos, letterPos);
+                // Increased range to 2.5 to be forgiving
+                if (distLetter < 2.5) {
                     gameState.canInteract = true;
                     gameState.interactType = 'letter';
                     showPrompt("RECOGER CARTA");
                 }
             }
 
-            // 3. Check Desk (To Read)
+            // 3. Desk Interaction (Reading)
             if (gameState.hasPickedUpLetter) {
-                const distDesk = pPos.distanceTo(gameState.deskPos);
-                if (distDesk < 2.0) {
+                const distDesk = getDistanceHorizontal(pPos, gameState.deskPos);
+                // Increased range to 2.5
+                if (distDesk < 2.5) {
                     gameState.canInteract = true;
                     gameState.interactType = 'desk';
                     showPrompt("LEER CARTA EN ESCRITORIO");
@@ -426,7 +473,8 @@
             if (gameState.interactType === 'letter') {
                 gameState.hasPickedUpLetter = true;
                 gameState.letterMesh.visible = false;
-                showPromptTemp("Has recogido la carta.");
+                // Visual feedback
+                showPromptTemp("Has recogido la carta. Ve al escritorio.");
             } else if (gameState.interactType === 'desk') {
                 openLetterUI();
             } else if (gameState.interactType === 'door') {
@@ -436,18 +484,17 @@
 
         function showPromptTemp(text) {
             const el = document.getElementById('interact-prompt');
-            const originalText = el.innerText;
             el.innerText = text;
             setTimeout(() => { 
                 if(gameState.canInteract) checkInteractions(); 
                 else el.style.display = 'none';
-            }, 2000);
+            }, 3000);
         }
 
-        // --- LOGIC: READING LETTERS ---
+        // --- LOGIC ---
         function openLetterUI() {
             gameState.isReading = true;
-            controls.unlock(); // Release mouse to use UI
+            controls.unlock();
 
             const data = letters[gameState.currentLetterIndex];
             document.getElementById('letter-sender').innerText = "De: " + data.sender;
@@ -458,7 +505,7 @@
             document.getElementById('hand-status').style.opacity = 1;
         }
 
-        // --- MEDIAPIPE & DECISIONS ---
+        // MediaPipe
         const videoElement = document.getElementById('camera-feedback');
         const yesBox = document.getElementById('yes-box');
         const noBox = document.getElementById('no-box');
@@ -470,7 +517,6 @@
             let activeHand = null;
 
             if (results.multiHandLandmarks && results.multiHandedness) {
-                // Check for confident detection
                 for (let i = 0; i < results.multiHandedness.length; i++) {
                     if (results.multiHandedness[i].score > 0.6) {
                         activeHand = results.multiHandedness[i].label;
@@ -479,7 +525,6 @@
                 }
             }
 
-            // Reset UI
             yesBox.classList.remove('active');
             noBox.classList.remove('active');
 
@@ -495,7 +540,7 @@
         }
 
         function startTimer(type) {
-            if (handTimer) return; // Already counting
+            if (handTimer) return; 
             handTimer = setTimeout(() => {
                 confirmDecision(type);
             }, 2000);
@@ -508,7 +553,6 @@
             const isYes = (handType === 'Right');
             const data = letters[gameState.currentLetterIndex];
 
-            // Apply Stats
             if (isYes) {
                 gameState.stats.brother += data.effectYes.brother;
                 gameState.stats.sister += data.effectYes.sister;
@@ -517,12 +561,11 @@
                 gameState.stats.sister += data.effectNo.sister;
             }
 
-            // Update HUD
+            // Update UI
             document.getElementById('stat-bro').innerText = gameState.stats.brother;
             document.getElementById('stat-sis').innerText = gameState.stats.sister;
             document.getElementById('letter-count').innerText = gameState.currentLetterIndex + 1;
 
-            // Close UI
             document.getElementById('letter-modal').style.display = 'none';
             document.getElementById('camera-feedback').style.opacity = 0;
             document.getElementById('hand-status').style.opacity = 0;
@@ -530,16 +573,14 @@
             
             gameState.currentLetterIndex++;
 
-            // Check Progress
             if (gameState.currentLetterIndex < letters.length) {
-                // Spawn next letter after delay
                 setTimeout(() => {
                     spawnLetter();
-                    controls.lock(); // Re-capture mouse for walking
+                    controls.lock();
                 }, 3000);
             } else {
-                // Game Over condition ready
-                showPromptTemp("Escucha... un golpe fuerte en la puerta.");
+                // Game Over state
+                showPromptTemp("Escucha... alguien golpea la puerta.");
                 controls.lock();
             }
         }
@@ -550,45 +591,58 @@
 
         function spawnLetter() {
             gameState.hasPickedUpLetter = false;
+            // Spawn under door
             gameState.letterMesh.position.set(0, 0.05, -ROOM_LIMIT + 2);
             gameState.letterMesh.visible = true;
-            showPromptTemp("¡Ding-dong! Ha llegado una carta.");
+            
+            // AUDIO FIX
+            showPromptTemp("¡Ding-dong! Carta recibida.");
+            SoundFX.playDoorbell();
         }
 
         function triggerEnding() {
-            controls.unlock();
+            // AUDIO FIX: Knocking sound sequence
+            SoundFX.playKnocksSequence();
+
             gameState.isGameOver = true;
             
-            // Animate Door
-            gameState.doorMesh.rotation.y = Math.PI / 1.8; 
-
+            // Wait for knocks to finish before opening door
             setTimeout(() => {
-                const endScreen = document.getElementById('ending-screen');
-                const endTitle = document.getElementById('ending-title');
-                const endText = document.getElementById('ending-text');
+                controls.unlock();
                 
-                endScreen.style.display = 'flex';
+                gameState.doorMesh.rotation.y = Math.PI / 1.8; 
 
-                // Determine Ending
-                // Good Ending: Brother > 60 AND Sister > 60
-                if (gameState.stats.brother > 60 && gameState.stats.sister > 60) {
-                    endTitle.innerText = "FAMILIA";
-                    endTitle.style.color = "#4CAF50";
-                    endText.innerHTML = "Abres la puerta.<br><br>Tus dos hermanos están allí, con una sonrisa.<br><br>'Gracias', dicen tusurando.<br><br>Por fin, no estás solo.";
-                } else {
-                    endTitle.innerText = "VACÍO";
-                    endTitle.style.color = "#888";
-                    endText.innerHTML = "Abres la puerta.<br><br>Nadie.<br><br>Solo el viento helado sopla a través de tu hogar.<br><br>Tus decisiones los alejaron para siempre.";
-                }
+                setTimeout(() => {
+                    const endScreen = document.getElementById('ending-screen');
+                    const endTitle = document.getElementById('ending-title');
+                    const endText = document.getElementById('ending-text');
+                    
+                    endScreen.style.display = 'flex';
+
+                    if (gameState.stats.brother > 60 && gameState.stats.sister > 60) {
+                        endTitle.innerText = "REENCUENTRO";
+                        endTitle.style.color = "#4CAF50";
+                        endText.innerHTML = "Abres la puerta.<br><br>Tus dos hermanos están allí, con una sonrisa.<br><br>'Gracias', dicen tusurando.<br><br>Por fin, no estás solo.";
+                    } else {
+                        endTitle.innerText = "VACÍO";
+                        endTitle.style.color = "#888";
+                        endText.innerHTML = "Abres la puerta.<br><br>Nadie.<br><br>Solo el viento helado sopla a través de tu hogar.<br><br>Tus decisiones los alejaron para siempre.";
+                    }
+                }, 1500);
             }, 1500);
         }
 
-        // --- INITIALIZATION ---
+        // --- INIT ---
         const startBtn = document.getElementById('start-btn');
         startBtn.addEventListener('click', async () => {
             startBtn.innerText = "Iniciando...";
             
             try {
+                // Resume Audio Context
+                if (audioCtx.state === 'suspended') {
+                    await audioCtx.resume();
+                }
+
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true });
                 videoElement.srcObject = stream;
                 await videoElement.play();
@@ -603,9 +657,9 @@
                 document.getElementById('hud').style.opacity = 1;
                 gameState.hasStarted = true;
 
-                controls.lock(); // Capture mouse immediately
+                controls.lock(); 
                 animate();
-                spawnLetter(); // First letter
+                spawnLetter(); 
 
             } catch (e) {
                 alert("Error de cámara: " + e.message + ". Usa HTTPS o Localhost.");
@@ -614,23 +668,15 @@
             }
         });
 
-        // Handle Pointer Lock logic correctly
-        controls.addEventListener('lock', () => {
-            // Resume game if paused
-        });
-        controls.addEventListener('unlock', () => {
-            // If we are not in a modal and not game over, show pause instruction (optional)
-            // For this version, if they click out while playing, they must click screen to resume (PointerLock behavior)
-        });
+        controls.addEventListener('lock', () => {});
+        controls.addEventListener('unlock', () => {});
         
-        // Click on canvas to re-lock if lost
         document.body.addEventListener('click', () => {
             if (gameState.hasStarted && !gameState.isReading && !gameState.isGameOver && !document.pointerLockElement) {
                 controls.lock();
             }
         });
 
-        // Resize
         window.addEventListener('resize', () => {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
